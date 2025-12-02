@@ -1,5 +1,5 @@
 from typing import Optional, Tuple
-from go_engine import GoBoard, Player
+from go_engine import GoBoard, Player, column_to_label, label_to_column
 from mcts_agent import MCTSAgent, RandomAgent
 
 
@@ -46,7 +46,7 @@ class GameUI:
         row_str = move_str[1:]
         
         try:
-            col = ord(col_char) - ord('A')
+            col = label_to_column(col_char)
             row = int(row_str) - 1
             
             if 0 <= row < self.board.size and 0 <= col < self.board.size:
@@ -171,7 +171,7 @@ class GameUI:
                     print("AI passed!")
                 else:
                     row, col = move
-                    move_str = f"{chr(65 + col)}{row + 1}"
+                    move_str = f"{column_to_label(col)}{row + 1}"
                     self.board.make_move(row, col)
                     print(f"AI played: {move_str}")
             
@@ -209,7 +209,7 @@ class GameUI:
                 print(f"{player_name} AI passed!")
             else:
                 row, col = move
-                move_str = f"{chr(65 + col)}{row + 1}"
+                move_str = f"{column_to_label(col)}{row + 1}"
                 self.board.make_move(row, col)
                 print(f"{player_name} AI played: {move_str}")
             

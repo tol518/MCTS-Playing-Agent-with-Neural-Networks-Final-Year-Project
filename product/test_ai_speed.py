@@ -1,4 +1,4 @@
-from go_engine import GoBoard, Player
+from go_engine import GoBoard, Player, column_to_label
 from mcts_agent import MCTSAgent
 import time
 
@@ -27,7 +27,7 @@ if move is None:
     print("  ❌ FAIL: AI passed instead of making a move!")
 else:
     row, col = move
-    move_str = f"{chr(65 + col)}{row + 1}"
+    move_str = f"{column_to_label(col)}{row + 1}"
     print(f"  ✅ SUCCESS: AI played {move_str}")
 
 print("\n" + "="*50)

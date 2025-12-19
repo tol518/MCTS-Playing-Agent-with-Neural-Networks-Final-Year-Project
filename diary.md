@@ -1,174 +1,51 @@
-# Development Diary - Go-Playing AI with MCTS
+# Development Diary (high-level, from git commits)
 
-## Project Overview
-A 9x9 Go game implementation with an AI opponent powered by Monte Carlo Tree Search (MCTS). Built in Python with both GUI and terminal interfaces.
+**Scope:** This diary is derived from `git log` on the `main` branch. It describes what was *committed* and adds high-level context about the likely intent and impact of each milestone.
 
----
-
-## Core Components
-
-### 1. Go Engine (`go_engine.py`)
-The game engine handling all Go rules and logic.
-
-**Key features implemented:**
-- Board representation using 2D list with `Player` enum (BLACK, WHITE, EMPTY)
-- Move validation including:
-  - Basic legality (empty position, on board)
-  - Suicide rule prevention
-  - Ko rule enforcement
-- Liberty counting with performance-optimized caching system
-- Group detection using flood-fill algorithm
-- Stone capture mechanics
-- Territory scoring with komi (6.5 points for White)
-- Board cloning for MCTS simulations
-- Undo/redo functionality with full state snapshots
-
-**Performance optimizations:**
-- Liberty caching using group IDs to avoid recalculating liberties
-- `get_adjacent_points_fast()` generator to avoid list allocations
-- Efficient board cloning that preserves cache state
-
-### 2. MCTS Agent (`mcts_agent.py`)
-AI implementation using Monte Carlo Tree Search.
-
-**MCTS phases implemented:**
-1. **Selection** - UCB1 formula for balancing exploration vs exploitation
-2. **Expansion** - Adding new nodes for unexplored moves
-3. **Simulation** - Random playouts with heuristic guidance
-4. **Backpropagation** - Updating win/visit counts up the tree
-
-**Advanced features:**
-- Tree reuse between turns (caches subtree for opponent's likely responses)
-- Adaptive heuristic weights that learn during play:
-  - Center preference
-  - Liberty awareness
-  - Connection bonus
-  - Capture pressure
-  - Edge penalties
-- Pattern table that learns from simulation outcomes
-- Move filtering to reduce search space (focuses on relevant areas)
-- Early termination when position is clearly decided
-- Conditioning on tree statistics (avoids moves that performed poorly)
-
-**Evaluation heuristics:**
-- Stone count with positional weighting (center stones worth more)
-- Territory estimation from adjacent stone influence
-- Capture count
-- Fast single-pass evaluation for simulation speed
-
-### 3. GUI (`game_gui.py`)
-Modern graphical interface using Tkinter.
-
-**Features:**
-- Visual board with wood texture effect
-- Stone rendering with shadows
-- Last move highlight marker
-- Hover preview showing legal moves
-- Dark and light theme support (auto-detects system preference)
-- Player indicator and capture counters
-- Game modes: Human vs AI (as Black or White), Human vs Human
-- Configurable AI thinking time (0.5 - 60 seconds)
-- Undo/redo buttons for move history navigation
-- Pass, New Game, and Quit controls
-
-### 4. Terminal UI (`game_ui.py`)
-Text-based interface for playing without GUI.
-- ASCII board display
-- Coordinate input (e.g., "D4", "pass")
-- Same game modes as GUI
+**Note:** Uncommitted/untracked work (e.g. currently `interim_report.md`) will not appear here until committed.
 
 ---
 
-## Testing
+### 2025-09-24 — Project kickoff and repo baseline
+- **Context**: The project is being formalised as a deliverable (FYP), so the first step is making it traceable, reproducible, and easy to understand.
+- **What happened (commit: `50e388e`)**: Repository initialized with a minimal starting point (`README.md`).
+- **Outcome**: A clean baseline that future work can build on, with an initial “source of truth” for what the project is.
+- **Next focus**: Deliver a first playable end-to-end version.
 
-### `test_go_engine.py`
-Unit tests for core game logic:
-- Board initialization
-- Stone placement
-- Capture mechanics
-- Liberty counting
-- Group detection
-- Suicide rule
-- Legal move generation
-- Pass and game over
-- Score calculation
-- Board cloning
+### 2025-10-25 — First end-to-end “vertical slice”: playable Go + baseline AI
+- **Context**: Early success criteria is not perfect play; it’s having the full system working: rules engine + UI + an AI that can take turns.
+- **What happened (commit: `b16b2a3`)**: Core implementation landed: Go rules/engine, MCTS agent, and both GUI + terminal ways to play, plus early tests/benchmarks scaffolding.
+- **Outcome**: The project becomes demonstrable: you can run a game, interact with the board, and play against an AI.
+- **Next focus**: Stabilize correctness (rules edge-cases), then iterate on performance and usability.
 
-### `test_mcts_agent.py`
-Tests for AI agent:
-- Returns legal moves
-- Doesn't mutate original board during search
+### 2025-10-25 — Automation foundation: CI added
+- **Context**: As complexity grows (rules engine + AI search), regressions become easy; automation is needed to keep quality under control.
+- **What happened (commit: `e0e5e5d`)**: CI configuration added.
+- **Outcome**: A pathway to consistent, repeatable checks when code changes.
+- **Next focus**: Expand tests so CI meaningfully guards correctness and prevents performance regressions.
 
-### `test_ai_speed.py`
-Performance benchmarking for AI.
+### 2025-10-25 — Branch history consolidation and docs polish
+- **Context**: After the initial drop, the priority is making the repository “presentable”: coherent branch history and better onboarding.
+- **What happened**:
+  - `c20ca7d`: merged `master` → `main` (administrative integration).
+  - `bd95f37`: adjusted `diary.md`.
+  - `95d3059`: refined `README.md`.
+- **Outcome**: Cleaner project presentation for supervision/review and easier navigation for a new reader.
+- **Next focus**: Turn the prototype into a more robust system (tests, speed, better UX).
 
----
+### 2025-12-02 — Hardening milestone: correctness, speed, and UX improvements
+- **Context**: Once the vertical slice exists, the real engineering work is making it reliable and fast enough for repeated AI simulations, while improving player experience.
+- **What happened (commit: `415a404`)**:
+  - Testing expanded (including AI-focused tests).
+  - Engine + MCTS improved for logic correctness and performance.
+  - UI improvements shipped, including **undo/redo** controls (critical for usability and debugging gameplay/AI decisions).
+- **Outcome**: A more trustworthy and usable system: better protected against regressions, faster iterations, and more user-friendly gameplay.
+- **Next focus**: Measure/validate AI strength and performance systematically; consider stronger playout heuristics, better evaluation, and richer tooling (e.g. SGF save/load).
 
-## File Structure
-```
-product/
-├── main.py           # Entry point (GUI/terminal selection)
-├── go_engine.py      # Core game logic
-├── mcts_agent.py     # AI implementation
-├── game_gui.py       # Graphical interface
-├── game_ui.py        # Terminal interface
-├── play_gui.py       # Quick GUI launcher
-├── test_go_engine.py # Engine unit tests
-├── test_mcts_agent.py# AI unit tests
-└── test_ai_speed.py  # Performance tests
-```
-
----
-
-## Recent Changes
-
-### Undo/Redo System
-Added full undo/redo support:
-- `_undo_stack` and `_redo_stack` store complete board snapshots
-- `undo()` restores previous state and pushes current to redo stack
-- `redo()` restores undone state
-- New moves clear the redo stack
-- GUI buttons: Undo, Redo
-
-### GUI Button Layout
-- Reorganized button bar to fit 5 buttons
-- Auto-sizing buttons using padding instead of fixed width
-- Shortened labels for better fit
-
----
-
-## How to Run
-```bash
-cd product
-python main.py
-```
-
-Select:
-1. Graphical Interface (recommended)
-2. Terminal Interface
-
----
-
-## Technical Notes
-
-### Why Liberty Caching?
-Go requires frequent liberty counting (checking if groups are captured). Naive counting is O(n) per query. The caching system:
-- Assigns unique group IDs to connected stones
-- Maintains `group_liberties[gid]` = set of liberty positions
-- Updates incrementally when stones are placed/removed
-- Reduces repeated calculations during MCTS simulations
-
-### Why Tree Reuse?
-MCTS explores many positions. When the opponent plays a move we already explored, we can reuse that subtree instead of starting from scratch, saving thousands of simulations.
-
-### Why Move Filtering?
-On a 9x9 board there are 81 possible moves. Many are irrelevant (far from existing stones). Filtering to ~20-30 relevant moves makes simulations 3-4x faster without losing quality.
-
----
-
-## Future Improvements
-- [ ] Neural network evaluation (AlphaGo-style)
-- [ ] Opening book for common patterns
-- [ ] Game record save/load (SGF format)
-- [ ] Online multiplayer
-- [ ] Larger board support (13x13, 19x19)
+### 2025-12-02 — Integration + documentation capture
+- **Context**: After a major milestone, the work is consolidated and written up while details are fresh.
+- **What happened**:
+  - `626938b` and `89ae257`: merges from a testing-focused branch into `main` (integration events).
+  - `8908224`: diary filled out.
+- **Outcome**: The milestone is merged, stabilized, and documented, making it easier to explain in reports and demos.
+- **Next focus**: Future work can build from a stable `main` with documented design choices.

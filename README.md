@@ -111,7 +111,4 @@ On a 9x9 board there are 81 possible moves; many are irrelevant far from existin
 
 ## Future Improvements
 - [ ] Neural network evaluation (AlphaGo-style)
-- [ ] Opening book for common patterns
 - [ ] Game record save/load (SGF format)
-- [ ] Online multiplayer
-- [ ] Larger board support (13x13, 19x19)

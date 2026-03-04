@@ -215,24 +215,22 @@ class GoBoard:
         return captured
     
     def is_suicide_move(self, row: int, col: int, player: Player) -> bool:
-        # Temporarily drop the stone to see whether it would instantly die without capturing
-        self.set_stone(row, col, player)
-        
         opponent = self.get_opponent(player)
-        captures_opponent = False
+        
         for adj_r, adj_c in self.get_adjacent_points(row, col):
-            if self.get_stone(adj_r, adj_c) == opponent:
-                if self.count_liberties(adj_r, adj_c) == 0:
-                    captures_opponent = True
-                    break
-        
-        # Check if the placed stone's group has liberties
-        has_liberties = self.count_liberties(row, col) > 0
-        
-        # Remove the temporary stone
-        self.set_stone(row, col, Player.EMPTY)
-        
-        return not has_liberties and not captures_opponent
+            stone = self.get_stone(adj_r, adj_c)
+            if stone == Player.EMPTY:
+                return False
+            elif stone == opponent:
+                gid = self._group_id[adj_r][adj_c]
+                if gid > 0 and gid in self._group_liberties and len(self._group_liberties[gid]) == 1:
+                    return False
+            elif stone == player:
+                gid = self._group_id[adj_r][adj_c]
+                if gid > 0 and gid in self._group_liberties and len(self._group_liberties[gid]) > 1:
+                    return False
+                    
+        return True
     
     def violates_ko(self, row: int, col: int) -> bool:
         return self.ko_point is not None and (row, col) == self.ko_point
@@ -257,6 +255,47 @@ class GoBoard:
             return False
         
         return True
+
+    def is_legal_move_fast(self, row: int, col: int, player: Player = None) -> bool:
+        """Ultra-fast legality check for simulations (skips ko, inlined checks)."""
+        if player is None:
+            player = self.current_player
+        
+        # Inline bounds and empty check
+        if row < 0 or row >= self.size or col < 0 or col >= self.size:
+            return False
+        if self.board[row][col] != Player.EMPTY:
+            return False
+        
+        # Single pass through neighbors
+        board = self.board
+        group_id = self._group_id
+        group_libs = self._group_liberties
+        size = self.size
+        opponent = Player.WHITE if player == Player.BLACK else Player.BLACK
+        
+        has_liberty = False
+        can_capture = False
+        connects_to_live_group = False
+        
+        # Check all 4 directions in one pass
+        for adj_r, adj_c in ((row-1, col), (row+1, col), (row, col-1), (row, col+1)):
+            if adj_r < 0 or adj_r >= size or adj_c < 0 or adj_c >= size:
+                continue
+            stone = board[adj_r][adj_c]
+            if stone == Player.EMPTY:
+                has_liberty = True
+                break  # Any liberty means legal
+            elif stone == opponent:
+                gid = group_id[adj_r][adj_c]
+                if gid > 0 and gid in group_libs and len(group_libs[gid]) == 1:
+                    can_capture = True
+            elif stone == player:
+                gid = group_id[adj_r][adj_c]
+                if gid > 0 and gid in group_libs and len(group_libs[gid]) > 1:
+                    connects_to_live_group = True
+        
+        return has_liberty or can_capture or connects_to_live_group
     
     def make_move(self, row: int, col: int, player: Player = None) -> bool:
         if player is None:
@@ -280,21 +319,34 @@ class GoBoard:
         captured = self.capture_adjacent_groups(row, col, player)
         
         # Check for ko
-        # Ko occurs when a single stone is captured and the board returns to previous state
+        # Ko occurs when a single stone is captured and the newly placed stone has only 1 liberty
         self.ko_point = None
-        if len(captured) == 1:
-            # Check if recapturing would return to previous board state
-            cap_r, cap_c = captured[0]
-            if previous_board == [[Player.EMPTY if c == player and r == row and col == col 
-                                   else previous_board[r][c] 
-                                   for c in range(self.size)] 
-                                  for r in range(self.size)]:
-                self.ko_point = captured[0]
+        if len(captured) == 1 and self.count_liberties(row, col) == 1:
+            self.ko_point = captured[0]
         
         # Record move in history
         self.move_history.append((row, col, player, len(captured)))
         
         # Switch players
+        self.current_player = self.get_opponent(self.current_player)
+        self.pass_count = 0
+        
+        return True
+
+    def make_move_fast(self, row: int, col: int, player: Player = None) -> bool:
+        """Fast move application for simulations (skips undo/redo and ko checks)."""
+        if player is None:
+            player = self.current_player
+        
+        if not self.is_legal_move_fast(row, col, player):
+            return False
+        
+        self.board[row][col] = player
+        self._place_stone_update_cache(row, col, player)
+        captured = self.capture_adjacent_groups(row, col, player)
+        
+        self.ko_point = None
+        self.move_history.append((row, col, player, len(captured)))
         self.current_player = self.get_opponent(self.current_player)
         self.pass_count = 0
         
@@ -305,6 +357,12 @@ class GoBoard:
         self._save_state_for_undo()
         self._redo_stack.clear()
         
+        self.move_history.append((-1, -1, self.current_player, 0))
+        self.current_player = self.get_opponent(self.current_player)
+        self.pass_count += 1
+
+    def pass_turn_fast(self):
+        """Fast pass for simulations (skips undo/redo)."""
         self.move_history.append((-1, -1, self.current_player, 0))
         self.current_player = self.get_opponent(self.current_player)
         self.pass_count += 1
@@ -320,6 +378,19 @@ class GoBoard:
         for row in range(self.size):
             for col in range(self.size):
                 if self.is_legal_move(row, col, player):
+                    legal_moves.append((row, col))
+        
+        return legal_moves
+
+    def get_legal_moves_fast(self, player: Player = None) -> List[Tuple[int, int]]:
+        """Fast legal move enumeration using the simulation legality check."""
+        if player is None:
+            player = self.current_player
+        
+        legal_moves = []
+        for row in range(self.size):
+            for col in range(self.size):
+                if self.is_legal_move_fast(row, col, player):
                     legal_moves.append((row, col))
         
         return legal_moves
@@ -427,6 +498,22 @@ class GoBoard:
         new_board._next_group_id = self._next_group_id
         # dont copy undo/redo stacks for clones (mcts clones dont need em)
         return new_board
+
+    def copy_state_from(self, other: 'GoBoard'):
+        """Copy board state and caches from another board into this instance."""
+        self.size = other.size
+        self.board = [row[:] for row in other.board]
+        self.current_player = other.current_player
+        self.move_history = other.move_history[:]
+        self.captured_stones = other.captured_stones.copy()
+        self.ko_point = other.ko_point
+        self.pass_count = other.pass_count
+        self._group_id = [row[:] for row in other._group_id]
+        self._group_liberties = {k: v.copy() for k, v in other._group_liberties.items()}
+        self._group_stones = {k: v.copy() for k, v in other._group_stones.items()}
+        self._next_group_id = other._next_group_id
+        self._undo_stack.clear()
+        self._redo_stack.clear()
     
     def _save_state_for_undo(self):
         """save current state to undo stack"""

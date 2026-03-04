@@ -6,8 +6,19 @@ Provides a 2D visual board with clickable intersections and proper coloring.
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Optional, Tuple
+from pathlib import Path
+from datetime import datetime
+import random
 from go_engine import GoBoard, Player, column_to_label
 from mcts_agent import MCTSAgent
+try:
+    from nn_mcts_agent import NNMCTSAgent
+except ImportError:
+    try:
+        from product.nn_mcts_agent import NNMCTSAgent
+    except ImportError:
+        NNMCTSAgent = None
+from profiler_utils import run_with_profiler
 import threading
 
 
@@ -26,9 +37,11 @@ class GoGUI:
         self.board_size = board_size
         self.board = GoBoard(board_size)
         self.ai_agent = None
+        self.ai_agent_2 = None  # second AI for AI-vs-AI mode
         self.ai_player = None
         self.ai_thinking_time = 5.0
         self.is_ai_thinking = False
+        self.current_mode = "human_vs_ai_black"
         
         self.cell_size = 52  # Size of each board cell in pixels
         self.margin = 45  # Margin around the board
@@ -537,9 +550,15 @@ class GoGUI:
     
     def make_human_move(self, row: int, col: int):
         """Make a move for the human player."""
+        if self.ai_agent and self.board.current_player == self.ai_player:
+            self.status_label.config(text="⏳ AI's turn — please wait", fg=self.accent)
+            self.root.after(1500, lambda: self.status_label.config(text=""))
+            return
         if self.board.is_legal_move(row, col):
             self.board.make_move(row, col)
             self.last_move = (row, col)
+            move_str = f"({row + 1}, {column_to_label(col)})"
+            print(f"Player move (Human): {move_str}")
             self.update_display()
             
             # Check if game is over
@@ -580,10 +599,23 @@ class GoGUI:
             self.status_label.config(text="⏭ AI passed", fg=self.text_secondary)
         else:
             row, col = move
-            self.board.make_move(row, col)
-            self.last_move = (row, col)
-            move_str = f"{column_to_label(col)}{row + 1}"
-            self.status_label.config(text=f"🎯 AI played: {move_str}", fg=self.accent_2)
+            if not self.board.is_legal_move(row, col):
+                # Fallback: choose a legal move or pass to avoid deadlock
+                legal_moves = self.board.get_legal_moves()
+                if legal_moves:
+                    row, col = random.choice(legal_moves)
+                else:
+                    row, col = None, None
+            if row is None:
+                self.board.pass_turn()
+                self.last_move = None
+                self.status_label.config(text="⏭ AI passed", fg=self.text_secondary)
+            else:
+                self.board.make_move(row, col)
+                self.last_move = (row, col)
+                move_str = f"{column_to_label(col)}{row + 1}"
+                print(f"Player move (AI): ({row + 1}, {column_to_label(col)})")
+                self.status_label.config(text=f"🎯 AI played: {move_str}", fg=self.accent_2)
         
         self.update_display()
         
@@ -670,6 +702,82 @@ class GoGUI:
         
         # Redraw board
         self.draw_board()
+
+    def _save_current_game_training_data(self) -> Optional[str]:
+        """Save finished game as training data for NN pipeline."""
+        if not self.board.move_history:
+            return None
+
+        try:
+            import torch
+            import sys
+            from pathlib import Path
+            
+            # Add project root and product dir to sys.path to ensure imports work
+            current_file = Path(__file__).resolve()
+            product_dir = current_file.parent
+            project_root = product_dir.parent
+            
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            if str(product_dir) not in sys.path:
+                sys.path.insert(0, str(product_dir))
+
+            try:
+                from nn.encoder import GoBoardEncoder
+                from nn.dataset import save_game_data
+            except ModuleNotFoundError:
+                try:
+                    from product.nn.encoder import GoBoardEncoder
+                    from product.nn.dataset import save_game_data
+                except ModuleNotFoundError:
+                    from encoder import GoBoardEncoder
+                    from dataset import save_game_data
+        except Exception as exc:
+            raise RuntimeError(f"Training modules unavailable: {exc}") from exc
+
+        encoder = GoBoardEncoder()
+        replay_board = GoBoard(self.board_size)
+
+        states = []
+        policies = []
+        players_to_move = []
+        action_size = self.board_size * self.board_size + 1
+
+        # Rebuild each pre-move state from move history to stay robust with undo/redo.
+        for move_idx, (row, col, _player, _captured) in enumerate(self.board.move_history):
+            states.append(encoder.encode(replay_board))
+            players_to_move.append(replay_board.current_player)
+
+            policy = torch.zeros(action_size, dtype=torch.float32)
+            if row < 0 or col < 0:
+                policy[action_size - 1] = 1.0  # pass action
+                replay_board.pass_turn()
+            else:
+                action_idx = row * self.board_size + col
+                policy[action_idx] = 1.0
+                if not replay_board.make_move(row, col):
+                    raise RuntimeError(
+                        f"Failed to replay move #{move_idx + 1} at ({row}, {col})."
+                    )
+            policies.append(policy)
+
+        winner = self.board.calculate_score()["winner"]
+        values = torch.tensor(
+            [[1.0 if player == winner else -1.0] for player in players_to_move],
+            dtype=torch.float32,
+        )
+
+        states_tensor = torch.stack(states)
+        policies_tensor = torch.stack(policies)
+
+        output_dir = Path(__file__).resolve().parent / "nn" / "data" / "human_games"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.current_mode}_{timestamp}.pt"
+        filepath = output_dir / filename
+
+        save_game_data(str(filepath), states_tensor, policies_tensor, values)
+        return str(filepath)
     
     def show_game_over(self):
         """Display game over dialog with final score."""
@@ -688,6 +796,33 @@ class GoGUI:
         message += f"  Territory: {score['white_territory']}\n"
         message += f"  Captures: {score['white_captures']}\n"
         message += f"  Komi: 6.5"
+
+        save_for_training = messagebox.askyesno(
+            "Save Training Data",
+            "Save this finished game for NN training data?",
+            icon="question",
+        )
+        if save_for_training:
+            try:
+                saved_path = self._save_current_game_training_data()
+                if saved_path:
+                    messagebox.showinfo(
+                        "Saved",
+                        f"Game data saved successfully:\n{saved_path}",
+                        icon="info",
+                    )
+                else:
+                    messagebox.showwarning(
+                        "No Data",
+                        "No moves were recorded in this game.",
+                        icon="warning",
+                    )
+            except Exception as exc:
+                messagebox.showerror(
+                    "Save Failed",
+                    f"Could not save game data:\n{exc}",
+                    icon="error",
+                )
         
         result = messagebox.askquestion(
             "Game Over",
@@ -793,6 +928,7 @@ class GoGUI:
             ("⚫ Play as Black vs AI", "human_vs_ai_black"),
             ("⚪ Play as White vs AI", "human_vs_ai_white"),
             ("👥 Human vs Human", "human_vs_human"),
+            ("🤖 NN-MCTS vs Old-MCTS", "ai_vs_ai"),
         ]
         
         for text, value in modes:
@@ -890,6 +1026,7 @@ class GoGUI:
         self.last_move = None
         self.hover_pos = None
         self.ai_thinking_time = ai_time
+        self.current_mode = mode
         
         if mode == "human_vs_ai_black":
             self.ai_player = Player.WHITE
@@ -901,13 +1038,93 @@ class GoGUI:
             self.status_label.config(text="You are White ⚪  •  AI is Black ⚫", fg=self.accent_2)
             # AI makes first move
             self.root.after(500, self.make_ai_move)
+        elif mode == "ai_vs_ai":
+            self.ai_player = None  # both are AI
+            if NNMCTSAgent is not None:
+                self.ai_agent = NNMCTSAgent(
+                    simulation_time=ai_time,
+                    c_puct=1.5,
+                )
+            else:
+                self.ai_agent = MCTSAgent(simulation_time=ai_time)
+            self.ai_agent_2 = MCTSAgent(simulation_time=ai_time)
+            self.status_label.config(
+                text="🤖 NN-MCTS (Black) vs Old-MCTS (White)", fg=self.accent_2
+            )
+            # Start the AI loop after a short delay
+            self.root.after(500, self._run_ai_vs_ai_step)
         else:  # human_vs_human
             self.ai_player = None
             self.ai_agent = None
+            self.ai_agent_2 = None
             self.status_label.config(text="👥 Human vs Human mode", fg=self.accent_2)
         
         self.update_display()
     
+    def _run_ai_vs_ai_step(self):
+        """One step of the AI-vs-AI loop: select move, apply, schedule next."""
+        if self.board.is_game_over():
+            self.show_game_over()
+            return
+
+        self.is_ai_thinking = True
+        current = self.board.current_player
+
+        if current == Player.BLACK:
+            agent = self.ai_agent
+            tag = "NN-MCTS"
+        else:
+            agent = self.ai_agent_2
+            tag = "Old-MCTS"
+
+        self.status_label.config(text=f"🤔 {tag} is thinking...", fg=self.accent)
+        self.canvas.config(cursor="watch")
+
+        def ai_thread():
+            move = agent.select_move(self.board)
+            self.root.after(0, lambda: self._complete_ai_vs_ai_move(move, tag))
+
+        thread = threading.Thread(target=ai_thread, daemon=True)
+        thread.start()
+
+    def _complete_ai_vs_ai_move(self, move, tag: str):
+        """Apply the AI move and schedule the next step."""
+        self.is_ai_thinking = False
+        self.canvas.config(cursor="")
+
+        if move is None:
+            self.board.pass_turn()
+            self.last_move = None
+            self.status_label.config(text=f"⏭ {tag} passed", fg=self.text_secondary)
+        else:
+            row, col = move
+            if not self.board.is_legal_move(row, col):
+                legal_moves = self.board.get_legal_moves()
+                if legal_moves:
+                    row, col = random.choice(legal_moves)
+                else:
+                    self.board.pass_turn()
+                    self.last_move = None
+                    self.update_display()
+                    if self.board.is_game_over():
+                        self.show_game_over()
+                    else:
+                        self.root.after(300, self._run_ai_vs_ai_step)
+                    return
+            self.board.make_move(row, col)
+            self.last_move = (row, col)
+            move_str = f"({row + 1}, {column_to_label(col)})"
+            self.status_label.config(text=f"🎯 {tag} played: {move_str}", fg=self.accent_2)
+            print(f"Player move ({tag}): {move_str}")
+
+        self.update_display()
+
+        if self.board.is_game_over():
+            self.show_game_over()
+        else:
+            # Short delay so the human can watch the game
+            self.root.after(300, self._run_ai_vs_ai_step)
+
     def _rebuild_ui(self):
         """Rebuild the UI with new theme colors."""
         # Update root background
@@ -957,4 +1174,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_profiler("game_gui", main)

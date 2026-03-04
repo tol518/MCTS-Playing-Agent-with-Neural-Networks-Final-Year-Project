@@ -1,8 +1,16 @@
 import math
 import random
 import time
-from typing import Optional, List, Tuple
-from go_engine import GoBoard, Player
+import os
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Optional, List, Tuple, Set
+try:
+    from product.go_engine import GoBoard, Player, column_to_label
+    from product.parallel_rollout import run_batch_rollouts, serialize_board_state
+except ModuleNotFoundError:
+    from go_engine import GoBoard, Player, column_to_label
+    from parallel_rollout import run_batch_rollouts, serialize_board_state
 
 
 class MCTSNode:
@@ -12,7 +20,7 @@ class MCTSNode:
     """
     
     def __init__(self, board: GoBoard, move: Optional[Tuple[int, int]] = None, 
-                 parent: Optional['MCTSNode'] = None):
+                 parent: Optional['MCTSNode'] = None, use_fast_legal: bool = False):
         """
         Initialize an MCTS node.
         
@@ -27,10 +35,23 @@ class MCTSNode:
         self.children = []
         self.wins = 0.0
         self.visits = 0
-        self.untried_moves = board.get_legal_moves()
+        self.use_fast_legal = use_fast_legal
+        if use_fast_legal:
+            self.untried_moves = board.get_legal_moves_fast()
+        else:
+            self.untried_moves = board.get_legal_moves()
         # If no legal moves exist, the only option is to pass
         if not self.untried_moves:
             self.untried_moves = [None]
+        else:
+            # Shuffle and sort by distance to center (center-biased expansion)
+            # Sort descending so center moves are at end (pop() takes from end)
+            random.shuffle(self.untried_moves)
+            center = board.size // 2
+            self.untried_moves.sort(
+                key=lambda m: abs(m[0] - center) + abs(m[1] - center) if m else -1,
+                reverse=True
+            )
         self.player = board.current_player
     
     def is_fully_expanded(self) -> bool:
@@ -57,13 +78,19 @@ class MCTSNode:
         
         if move is None:
             # Pass move
-            new_board.pass_turn()
+            if self.use_fast_legal:
+                new_board.pass_turn_fast()
+            else:
+                new_board.pass_turn()
         else:
             # Regular move
             row, col = move
-            new_board.make_move(row, col)
+            if self.use_fast_legal:
+                new_board.make_move_fast(row, col)
+            else:
+                new_board.make_move(row, col)
         
-        child_node = MCTSNode(new_board, move, self)
+        child_node = MCTSNode(new_board, move, self, use_fast_legal=self.use_fast_legal)
         self.children.append(child_node)
         return child_node
     
@@ -112,17 +139,71 @@ class MCTSAgent:
         # === TREE REUSE ===
         self._cached_tree = None  # root node from previous turn
         self._last_board_hash = None
+        # === REUSABLE SIM BOARD FOR ROLLOUTS ===
+        self._sim_board = None
+        # === PARALLEL ROLLOUTS ===
+        self._num_workers = max(1, os.cpu_count() - 1)  # leave one core for main thread
+        self._use_parallel = self._num_workers > 1
+        self._rollouts_per_batch = 8  # rollouts per worker task
+        self._executor = None  # lazily created, persistent pool
     
     def select_move(self, board: GoBoard) -> Optional[Tuple[int, int]]:
         # === TREE REUSE: try to find subtree from previous search ===
         root = self._try_reuse_tree(board)
         if root is None:
-            root = MCTSNode(board.clone())
+            root = MCTSNode(board.clone(), use_fast_legal=True)
         
         # Run simulations
         start_time = time.time()
         simulations = 0
         reused_visits = root.visits  # track how many we got for free
+        
+        # Use parallel rollouts if available
+        if self._use_parallel and self._num_workers > 1:
+            simulations = self._run_parallel_mcts(root, start_time)
+        else:
+            simulations = self._run_sequential_mcts(root, start_time)
+        
+        # Select the move with the most visits (most robust choice)
+        if not root.children:
+            # No legal moves, must pass
+            return None
+        
+        best_child = self._select_best_legal_child(root, board)
+        if best_child is None:
+            return None
+        
+        # === TREE REUSE: cache the chosen subtree for next turn ===
+        self._cache_subtree(best_child)
+        
+        reused = f" (+{reused_visits} reused)" if reused_visits > 0 else ""
+        print(f"MCTS completed {simulations} simulations{reused} in {time.time() - start_time:.2f}s")
+        if best_child.move is None:
+            move_label = "pass"
+        else:
+            row, col = best_child.move
+            move_label = f"({row + 1}, {column_to_label(col)})"
+        print(
+            f"Selected move: {move_label}, Visits: {best_child.visits}, "
+            f"Win rate: {best_child.wins / best_child.visits if best_child.visits > 0 else 0:.2%}"
+        )
+        
+        return best_child.move
+
+    def _select_best_legal_child(self, root: MCTSNode, board: GoBoard) -> Optional[MCTSNode]:
+        """Pick the most visited child that is legal on the real board."""
+        children_sorted = sorted(root.children, key=lambda c: c.visits, reverse=True)
+        for child in children_sorted:
+            if child.move is None:
+                return child
+            row, col = child.move
+            if board.is_legal_move(row, col):
+                return child
+        return None
+    
+    def _run_sequential_mcts(self, root: MCTSNode, start_time: float) -> int:
+        """Run MCTS with sequential rollouts (single-threaded)."""
+        simulations = 0
         
         while True:
             # Check termination conditions
@@ -132,42 +213,94 @@ class MCTSAgent:
                 break
             
             # === conditioning on tree statistics ===
-            # find moves with high visits but low win rate to avoid in simulations
             avoided_moves = set()
             for child in root.children:
                 if child.visits >= 5 and child.move is not None:
                     win_rate = child.wins / child.visits
-                    if win_rate < 0.3:  # poorly performing move
+                    if win_rate < 0.3:
                         avoided_moves.add(child.move)
             
             # MCTS four phases
             node = self._select(root)
             if not node.is_terminal():
                 node = self._expand(node)
-            result, heuristics_used = self._simulate(node, avoided_moves)
+            result = self._simulate(node, avoided_moves)
             self._backpropagate(node, result)
-            
-            # === adapt heuristic weights based on simulation outcome ===
-            self._update_heuristic_weights(heuristics_used, result)
-            
             simulations += 1
         
-        # Select the move with the most visits (most robust choice)
-        if not root.children:
-            # No legal moves, must pass
-            return None
+        return simulations
+    
+    def _get_executor(self):
+        """Get or create the persistent process pool."""
+        if self._executor is None:
+            self._executor = ProcessPoolExecutor(max_workers=self._num_workers)
+        return self._executor
+
+    def shutdown(self):
+        """Shut down the process pool."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+
+    def _run_parallel_mcts(self, root: MCTSNode, start_time: float) -> int:
+        """Run MCTS with parallel rollouts using multiprocessing."""
+        simulations = 0
+        # Use num_workers (not *2) to reduce simultaneous memory pressure on Windows
+        tasks_per_batch = self._num_workers
+        rollouts_per_task = self._rollouts_per_batch
         
-        best_child = max(root.children, key=lambda c: c.visits)
+        try:
+            executor = self._get_executor()
+        except Exception:
+            return self._run_sequential_mcts(root, start_time)
         
-        # === TREE REUSE: cache the chosen subtree for next turn ===
-        self._cache_subtree(best_child)
+        while True:
+            # Check termination
+            if self.max_simulations and simulations >= self.max_simulations:
+                break
+            if not self.max_simulations and (time.time() - start_time) >= self.simulation_time:
+                break
+            
+            # Collect nodes to simulate in parallel
+            nodes_to_sim = []
+            for _ in range(tasks_per_batch):
+                node = self._select(root)
+                if not node.is_terminal():
+                    node = self._expand(node)
+                nodes_to_sim.append(node)
+            
+            # Submit parallel rollouts (multiple rollouts per task)
+            futures = []
+            for node in nodes_to_sim:
+                board_state = serialize_board_state(node.board)
+                try:
+                    future = executor.submit(
+                        run_batch_rollouts,
+                        board_state,
+                        node.player,
+                        rollouts_per_task
+                    )
+                    futures.append((future, node))
+                except Exception:
+                    # Pool broken, fall back to sequential
+                    self._executor = None
+                    result = self._simulate(node, set())
+                    self._backpropagate(node, result)
+                    simulations += 1
+            
+            # Collect results and backpropagate
+            for future, node in futures:
+                try:
+                    results = future.result(timeout=5.0)
+                    for result in results:
+                        self._backpropagate(node, result)
+                        simulations += 1
+                except Exception:
+                    result = self._simulate(node, set())
+                    self._backpropagate(node, result)
+                    simulations += 1
         
-        reused = f" (+{reused_visits} reused)" if reused_visits > 0 else ""
-        print(f"MCTS completed {simulations} simulations{reused} in {time.time() - start_time:.2f}s")
-        print(f"Selected move: {best_child.move}, Visits: {best_child.visits}, "
-              f"Win rate: {best_child.wins / best_child.visits if best_child.visits > 0 else 0:.2%}")
-        
-        return best_child.move
+        return simulations
     
     def _try_reuse_tree(self, board: GoBoard) -> Optional[MCTSNode]:
         """Try to find a subtree from cached tree that matches current board"""
@@ -218,16 +351,15 @@ class MCTSAgent:
     def _expand(self, node: MCTSNode) -> MCTSNode:
         return node.expand()
     
-    def _simulate(self, node: MCTSNode, avoided_moves: set = None) -> Tuple[float, List[str]]:
-        """run a simulation and return (result, list of heuristics that influenced moves)"""
-        simulation_board = node.board.clone()
+    def _simulate(self, node: MCTSNode, avoided_moves: set = None) -> float:
+        """Run a fast rollout and return result."""
+        # reuse a single board to avoid per-rollout clones
+        if self._sim_board is None or self._sim_board.size != node.board.size:
+            self._sim_board = GoBoard(node.board.size)
+        simulation_board = self._sim_board
+        simulation_board.copy_state_from(node.board)
         starting_player = node.player
         avoided_moves = avoided_moves or set()
-        
-        # track which heuristics contributed to moves this simulation
-        heuristics_used = []
-        # track patterns used so we can update them after seeing the result
-        patterns_used = []
         
         # cache last move for filtering
         last_move = None
@@ -235,177 +367,232 @@ class MCTSAgent:
             lm = simulation_board.move_history[-1]
             if lm[0] >= 0:
                 last_move = (lm[0], lm[1])
+        frontier = self._build_frontier(simulation_board, last_move)
         
-        # Play moves until game is over or max moves
-        max_moves = 25  # reduced for speed
+        max_moves = 25
         moves_made = 0
         consecutive_passes = 0
+        size = simulation_board.size
         
         while consecutive_passes < 2 and moves_made < max_moves:
-            # === MOVE FILTERING: only consider relevant moves ===
-            legal_moves = self._filter_moves(simulation_board, last_move)
+            legal_moves = self._filter_moves(simulation_board, last_move, frontier)
             
-            # filter out avoided moves (from tree statistics)
             if avoided_moves and legal_moves:
                 filtered = [m for m in legal_moves if m not in avoided_moves]
                 if filtered:
                     legal_moves = filtered
             
             if not legal_moves:
-                simulation_board.pass_turn()
+                simulation_board.pass_turn_fast()
                 consecutive_passes += 1
                 last_move = None
             else:
-                # Choose a move using adaptive heuristics
-                move, h_used, pattern_key = self._select_simulation_move_fast(simulation_board, legal_moves)
-                heuristics_used.extend(h_used)
-                if pattern_key:
-                    patterns_used.append(pattern_key)
+                move = self._pick_rollout_move(simulation_board, legal_moves)
                 if move:
                     row, col = move
-                    simulation_board.make_move(row, col)
+                    simulation_board.make_move_fast(row, col)
                     consecutive_passes = 0
                     last_move = move
+                    self._update_frontier(frontier, move, size)
                 else:
-                    simulation_board.pass_turn()
+                    simulation_board.pass_turn_fast()
                     consecutive_passes += 1
                     last_move = None
             
             moves_made += 1
             
-            # === EARLY TERMINATION: stop if position is clearly decided ===
-            if moves_made % 8 == 0:  # check every 8 moves
-                quick_eval = self._fast_evaluate(simulation_board, starting_player)
-                if quick_eval > 0.85 or quick_eval < 0.15:
-                    break  # clear winner, stop early
+            # Early termination on large capture difference
+            if moves_made % 10 == 0:
+                cap_diff = simulation_board.captured_stones[starting_player] - simulation_board.captured_stones[
+                    Player.WHITE if starting_player == Player.BLACK else Player.BLACK
+                ]
+                if cap_diff > 8 or cap_diff < -8:
+                    break
         
-        # Fast evaluation
-        result = self._fast_evaluate(simulation_board, starting_player)
-        
-        # update pattern table
-        for pattern_key in patterns_used:
-            if pattern_key not in self.pattern_table:
-                self.pattern_table[pattern_key] = {'wins': 0.0, 'count': 0}
-            self.pattern_table[pattern_key]['wins'] += result
-            self.pattern_table[pattern_key]['count'] += 1
-        
-        return result, heuristics_used
-    
-    def _filter_moves(self, board: GoBoard, last_move: Optional[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """Filter legal moves to relevant ones for faster simulation"""
+        return self._fast_evaluate(simulation_board, starting_player)
+
+    def _add_radius(self, frontier: Set[Tuple[int, int]], row: int, col: int, size: int, radius: int):
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                r, c = row + dr, col + dc
+                if 0 <= r < size and 0 <= c < size:
+                    frontier.add((r, c))
+
+    def _add_influence_points(self, frontier: Set[Tuple[int, int]], row: int, col: int, size: int):
+        for adj_r, adj_c in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if 0 <= adj_r < size and 0 <= adj_c < size:
+                frontier.add((adj_r, adj_c))
+        for dr, dc in [(-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            r, c = row + dr, col + dc
+            if 0 <= r < size and 0 <= c < size:
+                frontier.add((r, c))
+
+    def _update_frontier(self, frontier: Set[Tuple[int, int]], move: Optional[Tuple[int, int]], size: int):
+        if move is None:
+            return
+        row, col = move
+        frontier.discard((row, col))
+        self._add_influence_points(frontier, row, col, size)
+        self._add_radius(frontier, row, col, size, 2)
+
+    def _build_frontier(self, board: GoBoard, last_move: Optional[Tuple[int, int]]) -> Set[Tuple[int, int]]:
         size = board.size
-        center = size // 2
-        
-        # collect candidate moves
-        candidates = set()
-        
-        # 1) moves near last move (local response) - most important
+        frontier: Set[Tuple[int, int]] = set()
+        board_data = board.board
+        for row in range(size):
+            row_data = board_data[row]
+            for col in range(size):
+                if row_data[col] != Player.EMPTY:
+                    self._add_influence_points(frontier, row, col, size)
         if last_move:
             lr, lc = last_move
-            for dr in range(-3, 4):
-                for dc in range(-3, 4):
+            self._add_radius(frontier, lr, lc, size, 2)
+        if len(board.move_history) < 20:
+            center = size // 2
+            frontier.add((center, center))
+            if size >= 9:
+                for sp in [(2, 2), (2, 6), (6, 2), (6, 6), (2, center), (6, center), (center, 2), (center, 6)]:
+                    if sp[0] < size and sp[1] < size:
+                        frontier.add(sp)
+        return frontier
+    
+    def _filter_moves(
+        self,
+        board: GoBoard,
+        last_move: Optional[Tuple[int, int]],
+        frontier: Optional[Set[Tuple[int, int]]] = None,
+    ) -> List[Tuple[int, int]]:
+        """Ultra-fast move filtering - inlined for speed"""
+        size = board.size
+        board_data = board.board
+        group_id = board._group_id
+        group_libs = board._group_liberties
+        current_player = board.current_player
+        opponent = Player.WHITE if current_player == Player.BLACK else Player.BLACK
+        
+        candidates = frontier if frontier is not None else set()
+        if not candidates and last_move:
+            candidates = set()
+            lr, lc = last_move
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
                     r, c = lr + dr, lc + dc
                     if 0 <= r < size and 0 <= c < size:
                         candidates.add((r, c))
         
-        # 2) moves adjacent to existing stones (expand/reduce groups)
-        for row in range(size):
-            for col in range(size):
-                if board.board[row][col] != Player.EMPTY:
-                    for adj_r, adj_c in board.get_adjacent_points_fast(row, col):
-                        candidates.add((adj_r, adj_c))
-                    # also one step further for influence
-                    for dr, dc in [(-2,0), (2,0), (0,-2), (0,2), (-1,-1), (-1,1), (1,-1), (1,1)]:
-                        r, c = row + dr, col + dc
-                        if 0 <= r < size and 0 <= c < size:
-                            candidates.add((r, c))
-        
-        # 3) star points / center for early game (handle different board sizes)
-        if len(board.move_history) < 20:
-            # add center and star points that fit on board
-            candidates.add((center, center))
-            if size >= 9:
-                for sp in [(2,2), (2,6), (6,2), (6,6), (2, center), (6, center), (center, 2), (center, 6)]:
-                    if sp[0] < size and sp[1] < size:
-                        candidates.add(sp)
-        
-        # filter to legal moves only
+        # Inlined legality check for speed
         legal = []
         for r, c in candidates:
-            if 0 <= r < size and 0 <= c < size:
-                if board.board[r][c] == Player.EMPTY and board.is_legal_move(r, c):
-                    legal.append((r, c))
+            if board_data[r][c] != Player.EMPTY:
+                continue
+            
+            # Inlined is_legal_move_fast
+            is_legal = False
+            for adj_r, adj_c in ((r-1, c), (r+1, c), (r, c-1), (r, c+1)):
+                if adj_r < 0 or adj_r >= size or adj_c < 0 or adj_c >= size:
+                    continue
+                stone = board_data[adj_r][adj_c]
+                if stone == Player.EMPTY:
+                    is_legal = True
+                    break
+                elif stone == opponent:
+                    gid = group_id[adj_r][adj_c]
+                    if gid > 0 and gid in group_libs and len(group_libs[gid]) == 1:
+                        is_legal = True
+                        break
+                elif stone == current_player:
+                    gid = group_id[adj_r][adj_c]
+                    if gid > 0 and gid in group_libs and len(group_libs[gid]) > 1:
+                        is_legal = True
+                        break
+            
+            if is_legal:
+                legal.append((r, c))
         
-        # fallback: if too few candidates, use all legal moves
-        if len(legal) < 5:
-            return board.get_legal_moves()
+        # Minimal fallback - just pick random empties without full validation
+        if len(legal) < 3:
+            for r in range(size):
+                row_data = board_data[r]
+                for c in range(size):
+                    if row_data[c] == Player.EMPTY and (r, c) not in candidates:
+                        # Quick check: has adjacent empty = legal
+                        for adj_r, adj_c in ((r-1, c), (r+1, c), (r, c-1), (r, c+1)):
+                            if 0 <= adj_r < size and 0 <= adj_c < size:
+                                if board_data[adj_r][adj_c] == Player.EMPTY:
+                                    legal.append((r, c))
+                                    break
+                        if len(legal) >= 5:
+                            return legal
         
         return legal
     
-    def _select_simulation_move_fast(self, board: GoBoard, legal_moves: List[Tuple[int, int]]) -> Tuple[Optional[Tuple[int, int]], List[str], Optional[tuple]]:
-        """Fast move selection for simulations - optimized version"""
-        if not legal_moves:
-            return None, [], None
-        
-        # for very small move lists, just pick randomly with basic heuristics
-        if len(legal_moves) <= 3:
-            move = random.choice(legal_moves)
-            return move, [], None
+    def _pick_rollout_move(self, board: GoBoard, legal_moves: List[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+        """Ultra-fast move selection for rollouts."""
+        n = len(legal_moves)
+        if n == 0:
+            return None
+        if n <= 3:
+            return legal_moves[int(random.random() * n)]
+        if n > 20:
+            return legal_moves[int(random.random() * n)]
         
         current_player = board.current_player
-        opponent = board.get_opponent(current_player)
+        opponent = Player.WHITE if current_player == Player.BLACK else Player.BLACK
         size = board.size
         center = size // 2
-        size_minus_1 = size - 1
+        size_m1 = size - 1
+        board_data = board.board
+        group_id = board._group_id
+        group_libs = board._group_liberties
         
-        scores = []
-        best_pattern_key = None
-        dominant_h = []
-        
-        # get last move once
         last_row, last_col = -1, -1
         if board.move_history:
             lm = board.move_history[-1]
             last_row, last_col = lm[0], lm[1]
         
+        scores = []
         for row, col in legal_moves:
             score = 1.0
             
-            # edge penalty (inlined)
-            if row == 0 or row == size_minus_1 or col == 0 or col == size_minus_1:
-                score *= 0.4
+            # Edge penalty
+            if row == 0 or row == size_m1 or col == 0 or col == size_m1:
+                score = 0.25
+            elif row == 1 or row == size_m1 - 1 or col == 1 or col == size_m1 - 1:
+                score = 0.65
             
-            # center bonus (simplified)
-            dist_to_center = abs(row - center) + abs(col - center)
-            score += max(0, (size - dist_to_center)) * 0.12
+            # Center bonus
+            score += max(0, size - abs(row - center) - abs(col - center)) * 0.14
             
-            # neighbor analysis (single pass)
-            friendly = 0
-            enemy = 0
+            # Neighbor analysis (inlined)
             enemy_in_atari = False
-            
-            for adj_r, adj_c in board.get_adjacent_points_fast(row, col):
-                stone = board.board[adj_r][adj_c]
+            friendly_in_atari = False
+            empty_adj = 0
+            for adj_r, adj_c in ((row-1, col), (row+1, col), (row, col-1), (row, col+1)):
+                if adj_r < 0 or adj_r >= size or adj_c < 0 or adj_c >= size:
+                    continue
+                stone = board_data[adj_r][adj_c]
                 if stone == current_player:
-                    friendly += 1
+                    score += 0.25
+                    gid = group_id[adj_r][adj_c]
+                    if gid > 0 and gid in group_libs and len(group_libs[gid]) == 1:
+                        friendly_in_atari = True
                 elif stone == opponent:
-                    enemy += 1
-                    # check if in atari using cache
-                    gid = board._group_id[adj_r][adj_c]
-                    if gid > 0 and gid in board._group_liberties:
-                        if len(board._group_liberties[gid]) == 1:
-                            enemy_in_atari = True
+                    gid = group_id[adj_r][adj_c]
+                    if gid > 0 and gid in group_libs and len(group_libs[gid]) == 1:
+                        enemy_in_atari = True
+                    else:
+                        score += 0.3
+                else:
+                    empty_adj += 1
             
-            # connection bonus
-            score += friendly * 0.25
-            
-            # capture bonus
             if enemy_in_atari:
                 score += 2.5
-            elif enemy > 0:
-                score += 0.3
+            if friendly_in_atari:
+                score += 1.2
+            if empty_adj <= 1 and not enemy_in_atari and not friendly_in_atari:
+                score *= 0.35
             
-            # follow last move
+            # Follow last move
             if last_row >= 0:
                 dist = abs(row - last_row) + abs(col - last_col)
                 if dist <= 2:
@@ -413,22 +600,19 @@ class MCTSAgent:
                 elif dist <= 4:
                     score += 0.2
             
-            scores.append(max(score, 0.01))
+            scores.append(score if score > 0.01 else 0.01)
         
-        # weighted selection
-        total = sum(scores)
+        # Weighted random pick
+        total = 0.0
+        for s in scores:
+            total += s
         pick = random.random() * total
         cumulative = 0.0
-        for i, s in enumerate(scores):
-            cumulative += s
+        for i in range(n):
+            cumulative += scores[i]
             if pick <= cumulative:
-                return legal_moves[i], dominant_h, best_pattern_key
-        
-        return legal_moves[-1], dominant_h, best_pattern_key
-    
-    def _select_simulation_move(self, board: GoBoard, legal_moves: List[Tuple[int, int]]) -> Tuple[Optional[Tuple[int, int]], List[str], Optional[tuple]]:
-        """Full move selection with all heuristics - used for expansion"""
-        return self._select_simulation_move_fast(board, legal_moves)
+                return legal_moves[i]
+        return legal_moves[-1]
     
     def _fast_evaluate(self, board: GoBoard, player: Player) -> float:
         """Single-pass evaluation: stones + influence + territory in one loop"""

@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 from go_engine import GoBoard, Player, column_to_label, label_to_column
 from mcts_agent import MCTSAgent, RandomAgent
+from profiler_utils import run_with_profiler
 
 
 class GameUI:
@@ -298,4 +299,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_profiler("game_ui", main)

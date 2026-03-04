@@ -1,6 +1,7 @@
-import sys
+from profiler_utils import run_with_profiler
 
-if __name__ == "__main__":
+
+def main():
     print("=" * 50)
     print("  Welcome to Go-Playing AI with MCTS!")
     print("  9x9 Board Implementation")
@@ -25,3 +26,7 @@ if __name__ == "__main__":
             print("Falling back to terminal interface...")
             from game_ui import main
             main()
+
+
+if __name__ == "__main__":
+    run_with_profiler("main", main)

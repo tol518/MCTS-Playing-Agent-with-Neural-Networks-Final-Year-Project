@@ -1,35 +1,36 @@
 from go_engine import GoBoard, Player, column_to_label
 from mcts_agent import MCTSAgent
 import time
+import os
 
-print("Testing AI performance...\n")
 
-# Create empty board
-board = GoBoard(9)
-print("Empty 9x9 board created")
-print(f"Legal moves available: {len(board.get_legal_moves())}")
+if __name__ == '__main__':
+    print("Testing AI performance...\n")
+    print(f"CPU count: {os.cpu_count()}")
 
-# Create AI with short thinking time
-ai = MCTSAgent(simulation_time=2.0)
-print(f"AI created with 2 second thinking time\n")
+    board = GoBoard(9)
+    print(f"Legal moves available: {len(board.get_legal_moves())}")
 
-# Test AI move
-print("AI is thinking...")
-start = time.time()
-move = ai.select_move(board)
-elapsed = time.time() - start
+    # Test 1: Sequential (force single-threaded)
+    print("\n--- Sequential MCTS (no multiprocessing) ---")
+    ai_seq = MCTSAgent(simulation_time=5.0)
+    ai_seq._use_parallel = False  # force sequential
+    start = time.time()
+    move = ai_seq.select_move(board)
+    elapsed = time.time() - start
+    if move:
+        print(f"  Move: ({move[0]+1}, {column_to_label(move[1])})")
 
-print(f"\nResult:")
-print(f"  Time taken: {elapsed:.2f}s")
-print(f"  Move selected: {move}")
+    # Test 2: Parallel
+    print("\n--- Parallel MCTS ---")
+    board2 = GoBoard(9)
+    ai_par = MCTSAgent(simulation_time=5.0)
+    ai_par._use_parallel = True
+    print(f"  Workers: {ai_par._num_workers}")
+    start = time.time()
+    move = ai_par.select_move(board2)
+    elapsed = time.time() - start
+    if move:
+        print(f"  Move: ({move[0]+1}, {column_to_label(move[1])})")
 
-if move is None:
-    print("  ❌ FAIL: AI passed instead of making a move!")
-else:
-    row, col = move
-    move_str = f"{column_to_label(col)}{row + 1}"
-    print(f"  ✅ SUCCESS: AI played {move_str}")
-
-print("\n" + "="*50)
-print("If AI selected an actual move (not None), the fix worked!")
-print("="*50)
+    print("\nDone!")

@@ -217,8 +217,12 @@ def _fast_evaluate_standalone(board: GoBoard, player: Player) -> float:
                 elif white_adj > 0 and black_adj == 0:
                     white_score += 0.25 * white_adj
     
-    black_score += board.captured_stones[Player.BLACK]
-    white_score += board.captured_stones[Player.WHITE] + 6.5
+    try:
+        black_score += board.captured_stones.get(Player.BLACK, 0)
+        white_score += board.captured_stones.get(Player.WHITE, 0) + 6.5
+    except (KeyError, TypeError):
+        # Fallback: enum keys may not survive cross-process pickling
+        white_score += 6.5
     
     diff = black_score - white_score
     if player == Player.WHITE:
@@ -244,7 +248,19 @@ def run_single_rollout(board_state: dict, starting_player: Player) -> float:
     board.board = [row[:] for row in board_state['board']]
     board.current_player = board_state['current_player']
     board.move_history = board_state['move_history'][:]
-    board.captured_stones = board_state['captured_stones'].copy()
+    # Rebuild captured_stones with proper Player enum keys
+    raw_caps = board_state['captured_stones']
+    board.captured_stones = {}
+    for k, v in raw_caps.items():
+        if isinstance(k, Player):
+            board.captured_stones[k] = v
+        elif k == 1 or k == Player.BLACK.value:
+            board.captured_stones[Player.BLACK] = v
+        elif k == 2 or k == Player.WHITE.value:
+            board.captured_stones[Player.WHITE] = v
+    # Ensure both keys exist
+    board.captured_stones.setdefault(Player.BLACK, 0)
+    board.captured_stones.setdefault(Player.WHITE, 0)
     board.ko_point = board_state['ko_point']
     board.pass_count = board_state['pass_count']
     board._group_id = [row[:] for row in board_state['group_id']]

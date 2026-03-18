@@ -13,6 +13,8 @@ import time
 import math
 import random
 import argparse
+import traceback
+import gc
 from pathlib import Path
 from datetime import datetime
 from typing import List, Tuple, Optional
@@ -87,7 +89,7 @@ class SelfPlayGame:
         move_num = 0
         consecutive_passes = 0
         max_moves = 90   # 9x9 games rarely exceed 81 meaningful moves
-        game_timeout = 180.0  # max seconds per game
+        game_timeout = 600.0  # max seconds per game (10 mins)
         game_start = time.time()
 
         while not board.is_game_over() and move_num < max_moves and consecutive_passes < 2:
@@ -134,6 +136,9 @@ class SelfPlayGame:
         states_t = torch.stack(states)           # [N, 16, 9, 9]
         policies_t = torch.stack(policies)       # [N, 82]
         values_t = torch.tensor(value_list, dtype=torch.float32).unsqueeze(1)  # [N, 1]
+
+        # Explicitly invoke garbage collector to clean up cyclic MCTS node references
+        gc.collect()
 
         return states_t, policies_t, values_t
 
@@ -500,25 +505,34 @@ def main():
         black_wins = 0
         white_wins = 0
 
-        for game_num in range(args.games_per_iter):
-            game_start = time.time()
-            s, p, v = game_generator.play()
-            game_time = time.time() - game_start
+        try:
+            for game_num in range(args.games_per_iter):
+                game_start = time.time()
+                s, p, v = game_generator.play()
+                game_time = time.time() - game_start
 
-            iter_states.append(s)
-            iter_policies.append(p)
-            iter_values.append(v)
-            total_moves += s.size(0)
+                iter_states.append(s)
+                iter_policies.append(p)
+                iter_values.append(v)
+                total_moves += s.size(0)
 
-            # Count wins
-            if v[0].item() > 0:
-                black_wins += 1
-            else:
-                white_wins += 1
+                # Count wins
+                if v[0].item() > 0:
+                    black_wins += 1
+                else:
+                    white_wins += 1
 
-            print(f"  Game {game_num + 1}/{args.games_per_iter}: "
-                  f"{s.size(0)} moves, {game_time:.1f}s "
-                  f"(winner: {'Black' if v[0].item() > 0 else 'White'})")
+                print(f"  Game {game_num + 1}/{args.games_per_iter}: "
+                      f"{s.size(0)} moves, {game_time:.1f}s "
+                      f"(winner: {'Black' if v[0].item() > 0 else 'White'})")
+                      
+                # Clean up memory explicitly between games
+                gc.collect()
+        except Exception as e:
+            print(f"\\nCRASH DURING GAME {game_num + 1}: {e}")
+            traceback.print_exc()
+            print("Trying to save progress before exiting...")
+            break
 
         print(f"\nSelf-play done: {total_moves} positions, "
               f"B wins: {black_wins}, W wins: {white_wins}")

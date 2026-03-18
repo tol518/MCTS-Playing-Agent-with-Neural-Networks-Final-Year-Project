@@ -43,9 +43,9 @@ class GoGUI:
         self.is_ai_thinking = False
         self.current_mode = "human_vs_ai_black"
         
-        self.cell_size = 52  # Size of each board cell in pixels
-        self.margin = 45  # Margin around the board
-        self.stone_radius = 22  # Radius of stones
+        self.cell_size = 42  # Size of each board cell in pixels
+        self.margin = 35  # Margin around the board
+        self.stone_radius = 18  # Radius of stones
         
         # Theme definitions
         self.themes = {
@@ -839,7 +839,7 @@ class GoGUI:
         """Show modern game setup dialog."""
         setup_window = tk.Toplevel(self.root)
         setup_window.title("New Game")
-        setup_window.geometry("420x540")
+        setup_window.geometry("420x620")
         setup_window.resizable(False, False)
         setup_window.configure(bg=self.bg_dark)
         
@@ -927,6 +927,8 @@ class GoGUI:
         modes = [
             ("⚫ Play as Black vs AI", "human_vs_ai_black"),
             ("⚪ Play as White vs AI", "human_vs_ai_white"),
+            ("🧠 Play as Black vs NN-AI", "human_vs_nn_black"),
+            ("🧠 Play as White vs NN-AI", "human_vs_nn_white"),
             ("👥 Human vs Human", "human_vs_human"),
             ("🤖 NN-MCTS vs Old-MCTS", "ai_vs_ai"),
         ]
@@ -1031,11 +1033,27 @@ class GoGUI:
         if mode == "human_vs_ai_black":
             self.ai_player = Player.WHITE
             self.ai_agent = MCTSAgent(simulation_time=ai_time)
-            self.status_label.config(text="You are Black ⚫  •  AI is White ⚪", fg=self.accent_2)
+            self.status_label.config(text="You are Black ⚫  •  Old-MCTS is White ⚪", fg=self.accent_2)
         elif mode == "human_vs_ai_white":
             self.ai_player = Player.BLACK
             self.ai_agent = MCTSAgent(simulation_time=ai_time)
-            self.status_label.config(text="You are White ⚪  •  AI is Black ⚫", fg=self.accent_2)
+            self.status_label.config(text="You are White ⚪  •  Old-MCTS is Black ⚫", fg=self.accent_2)
+            # AI makes first move
+            self.root.after(500, self.make_ai_move)
+        elif mode == "human_vs_nn_black":
+            self.ai_player = Player.WHITE
+            if NNMCTSAgent is not None:
+                self.ai_agent = NNMCTSAgent(simulation_time=ai_time, c_puct=1.5)
+            else:
+                self.ai_agent = MCTSAgent(simulation_time=ai_time)
+            self.status_label.config(text="You are Black ⚫  •  NN-MCTS is White ⚪", fg=self.accent_2)
+        elif mode == "human_vs_nn_white":
+            self.ai_player = Player.BLACK
+            if NNMCTSAgent is not None:
+                self.ai_agent = NNMCTSAgent(simulation_time=ai_time, c_puct=1.5)
+            else:
+                self.ai_agent = MCTSAgent(simulation_time=ai_time)
+            self.status_label.config(text="You are White ⚪  •  NN-MCTS is Black ⚫", fg=self.accent_2)
             # AI makes first move
             self.root.after(500, self.make_ai_move)
         elif mode == "ai_vs_ai":

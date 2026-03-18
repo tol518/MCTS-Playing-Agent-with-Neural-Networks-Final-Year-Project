@@ -126,9 +126,12 @@ class NNMCTSAgent:
         self.c_puct = c_puct
 
         # Default checkpoint path relative to this file
+        # Prefer RL-trained checkpoint over supervised-only
         if checkpoint_path is None:
             _this_dir = os.path.dirname(os.path.abspath(__file__))
-            checkpoint_path = os.path.join(_this_dir, "nn", "checkpoints", "joint_best.pt")
+            rl_path = os.path.join(_this_dir, "nn", "checkpoints", "rl_last.pt")
+            supervised_path = os.path.join(_this_dir, "nn", "checkpoints", "joint_best.pt")
+            checkpoint_path = rl_path if os.path.exists(rl_path) else supervised_path
 
         # Device selection
         if device is None:
@@ -157,6 +160,7 @@ class NNMCTSAgent:
         self._cache: Dict[str, Tuple] = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._cache_max_size = 50000  # evict when exceeded to prevent RAM exhaustion
 
         # Tree reuse
         self._cached_tree = None
@@ -207,20 +211,25 @@ class NNMCTSAgent:
 
         best_child = max(root.children, key=lambda c: c.visit_count)
 
-        # Anti-pass safeguard: never pass before move 50 if any board move exists
-        num_moves = len(board.move_history)
+        # Score-aware pass gate (bidirectional):
+        #   - If behind/even → block pass, force a real move
+        #   - If massively ahead → force pass to end the game
+        my_color = board.current_player
+        score_margin = self._quick_score(board, my_color)
+
         if best_child.move is None:
+            # NN wants to pass — only allow if genuinely ahead by 5+
             non_pass = [c for c in root.children if c.move is not None and c.visit_count > 0]
-            if non_pass:
-                if num_moves < 50:
-                    # Unconditionally override pass in early/mid game
-                    best_child = max(non_pass, key=lambda c: c.visit_count)
-                else:
-                    # Late game: only pass if it has >95% of visits
-                    total_visits = sum(c.visit_count for c in root.children)
-                    pass_ratio = best_child.visit_count / max(1, total_visits)
-                    if pass_ratio < 0.95:
-                        best_child = max(non_pass, key=lambda c: c.visit_count)
+            if non_pass and score_margin < 5.0:
+                best_child = max(non_pass, key=lambda c: c.visit_count)
+        else:
+            # NN wants to play a move — but if we're ahead by 10+,
+            # the game is clearly won, so force a pass to end it
+            if score_margin >= 10.0:
+                # Find the pass child (or just return None directly)
+                pass_child = next((c for c in root.children if c.move is None), None)
+                if pass_child is not None:
+                    best_child = pass_child
 
         # Cache subtree for reuse
         self._cache_subtree(best_child)
@@ -241,6 +250,21 @@ class NNMCTSAgent:
         )
 
         return best_child.move
+
+    # ------------------------------------------------------------------
+    # Score-aware pass gating
+    # ------------------------------------------------------------------
+
+    def _quick_score(self, board, my_color) -> float:
+        """
+        Return how many points `my_color` is ahead by (negative = behind).
+        Uses the GoBoard's built-in Chinese scoring (stones + territory + komi).
+        """
+        result = board.calculate_score(komi=6.5)
+        if my_color == Player.BLACK:
+            return result['black'] - result['white']  # positive = Black ahead
+        else:
+            return result['white'] - result['black']  # positive = White ahead
 
     # ------------------------------------------------------------------
     # MCTS Phases
@@ -278,15 +302,13 @@ class NNMCTSAgent:
             move_priors.append((move, prior))
             total_prior += prior
 
-        # Only include pass as an option after move 50
-        # Before that, the overconfident value head causes degenerate passing
-        num_moves_played = len(board.move_history)
-        if num_moves_played >= 50 or not legal_moves:
-            pass_prior = policy_probs[81] if len(policy_probs) > 81 else 0.01
-            if num_moves_played < 60:
-                pass_prior *= 0.05  # still penalize in late-midgame
-            move_priors.append((None, pass_prior))
-            total_prior += pass_prior
+        # Always include pass but with a heavy penalty to discourage the
+        # Value Head's overconfidence from inflating pass visit counts.
+        # The score-aware gate in select_move() is the real safeguard.
+        pass_prior = policy_probs[81] if len(policy_probs) > 81 else 0.01
+        pass_prior *= 0.01  # 100x penalty to prevent cache-spinning
+        move_priors.append((None, pass_prior))
+        total_prior += pass_prior
 
         # Normalize priors so they sum to 1 over legal moves
         if total_prior > 0:
@@ -393,6 +415,11 @@ class NNMCTSAgent:
             value = (-raw_value + 1.0) / 2.0  # flip for white
 
         result = (policy_probs, value)
+
+        # Evict cache if too large to prevent RAM exhaustion
+        if len(self._cache) >= self._cache_max_size:
+            self._cache.clear()
+
         self._cache[board_key] = result
         return result
 

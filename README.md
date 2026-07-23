@@ -1,9 +1,5 @@
 # Final Year Project
 
-This repository has been created to store your final year project.
-
-You may edit it as you like, but please do not remove the default topics or the project members list. These need to stay as currently defined in order for your supervisor to be able to find your project.
-
 ---
 
 ## Project Overview
@@ -33,6 +29,7 @@ A pre-trained checkpoint is loaded automatically from `product/nn/checkpoints/` 
 ## Core Components
 
 ### Go Engine (`product/go_engine.py`)
+
 The rules engine underpinning all gameplay and AI search.
 
 - **Board representation**: 2D list with a `Player` enum (BLACK, WHITE, EMPTY)
@@ -46,6 +43,7 @@ The rules engine underpinning all gameplay and AI search.
 ---
 
 ### MCTS Agent (`product/mcts_agent.py`)
+
 Original hand-crafted AI using Monte Carlo Tree Search (UCB1-based).
 
 - **Phases**: Selection (UCB1) → Expansion → Simulation (random playouts + heuristics) → Backpropagation
@@ -60,20 +58,22 @@ Original hand-crafted AI using Monte Carlo Tree Search (UCB1-based).
 ---
 
 ### Neural Network — `AlphaGoZeroNetwork` (`product/nn/model.py`)
+
 An **AlphaGo Zero-style CNN** implemented in PyTorch.
 
-| Component | Details |
-|---|---|
-| **Input** | 16-channel 9×9 tensor (board features encoded by `GoBoardEncoder`) |
-| **Shared trunk** | Initial 3×3 Conv + BatchNorm + ReLU, then **5 Residual blocks** (128 channels) |
-| **Policy head** | 1×1 Conv → Flatten → Linear → **82 raw logits** (81 board squares + 1 pass) |
-| **Value head** | 1×1 Conv → Flatten → Linear(128) → Linear(1) → **Tanh** → scalar in [−1, 1] |
+| Component              | Details                                                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| **Input**        | 16-channel 9×9 tensor (board features encoded by`GoBoardEncoder`)                    |
+| **Shared trunk** | Initial 3×3 Conv + BatchNorm + ReLU, then**5 Residual blocks** (128 channels)    |
+| **Policy head**  | 1×1 Conv → Flatten → Linear →**82 raw logits** (81 board squares + 1 pass)    |
+| **Value head**   | 1×1 Conv → Flatten → Linear(128) → Linear(1) →**Tanh** → scalar in [−1, 1] |
 
 The value output is from Black's perspective; the agent converts it to the current player's win probability at inference time.
 
 ---
 
 ### NN-MCTS Agent (`product/nn_mcts_agent.py`)
+
 Replaces random rollouts with neural network evaluation.
 
 - **Selection**: PUCT formula — `Q(s,a) + c_puct × P(s,a) × √N_parent / (1 + N_child)` — using policy priors from the network
@@ -86,6 +86,7 @@ Replaces random rollouts with neural network evaluation.
 ---
 
 ### Self-Play RL Pipeline (`product/nn/self_play.py`)
+
 AlphaZero-style reinforcement learning loop.
 
 - The NN-MCTS agent plays games against itself, generating `(state, policy_target, value_target)` training examples
@@ -95,6 +96,7 @@ AlphaZero-style reinforcement learning loop.
 ---
 
 ### Supervised Pre-training (`product/nn/train.py` + `product/nn/parse_sgf.py`)
+
 - **SGF parser** (`parse_sgf.py`): converts professional game records into board states and move labels
 - **Pre-training**: CNN trained on ~1.8 million professional game samples using the **Adam optimizer** before RL begins, giving the agent a strong prior
 - **Dataset / Encoder** (`dataset.py`, `encoder.py`): encode board state into 16 feature planes (stone positions, liberties, turn, ko, etc.)
@@ -102,6 +104,7 @@ AlphaZero-style reinforcement learning loop.
 ---
 
 ### GUI (`product/game_gui.py`)
+
 Tkinter graphical interface.
 
 - **Agents selectable**: Human, MCTS, **NN-MCTS** (new)
@@ -115,6 +118,7 @@ Tkinter graphical interface.
 ---
 
 ### Terminal UI (`product/game_ui.py`)
+
 Text-based interface.
 
 - ASCII board display with coordinate input (e.g. `D4`, `pass`)
@@ -123,6 +127,7 @@ Text-based interface.
 ---
 
 ### Tournament / Profiling (`product/tournament.py`, `product/profiler_utils.py`)
+
 - `tournament.py`: runs automated head-to-head matches between any two agent types; used to verify NN-MCTS beats the baseline MCTS
 - `profiler_utils.py`: timing and throughput utilities for benchmarking MCTS simulation speed
 
@@ -130,15 +135,15 @@ Text-based interface.
 
 ## Testing
 
-| File | Purpose |
-|---|---|
-| `product/test_go_engine.py` | Engine logic: captures, liberties, legality, ko/suicide, scoring, cloning |
-| `product/test_mcts_agent.py` | AI sanity checks: legal move selection, board not mutated during search |
-| `product/test_ai_speed.py` | Performance benchmarking of MCTS throughput |
-| `product/nn/test_encoder.py` | Board encoder correctness (feature planes) |
-| `product/nn/test_dataset.py` | SGF-parsed dataset integrity checks |
-| `product/nn/cnn_throughput_test.py` | NN inference throughput (CPU vs GPU) |
-| `product/nn/cuda_smoke_test.py` | Verifies CUDA availability and basic tensor ops |
+| File                                  | Purpose                                                                   |
+| ------------------------------------- | ------------------------------------------------------------------------- |
+| `product/test_go_engine.py`         | Engine logic: captures, liberties, legality, ko/suicide, scoring, cloning |
+| `product/test_mcts_agent.py`        | AI sanity checks: legal move selection, board not mutated during search   |
+| `product/test_ai_speed.py`          | Performance benchmarking of MCTS throughput                               |
+| `product/nn/test_encoder.py`        | Board encoder correctness (feature planes)                                |
+| `product/nn/test_dataset.py`        | SGF-parsed dataset integrity checks                                       |
+| `product/nn/cnn_throughput_test.py` | NN inference throughput (CPU vs GPU)                                      |
+| `product/nn/cuda_smoke_test.py`     | Verifies CUDA availability and basic tensor ops                           |
 
 ---
 
@@ -183,16 +188,21 @@ PROJECT/
 ## Technical Notes
 
 ### Why Liberty Caching?
+
 Go requires frequent liberty counting. Naive counting is O(n) per group; caching group IDs and their current liberty sets reduces repeated recalculation during gameplay and across thousands of MCTS simulations.
 
 ### Why Tree Reuse?
+
 When the opponent plays a move already explored by MCTS, the corresponding subtree can be re-rooted instead of discarding it, saving many simulations and improving play strength with the same time budget.
 
 ### Why PUCT over UCB1?
+
 UCB1 treats all moves uniformly. PUCT incorporates the policy network's prior `P(s,a)`, directing search towards moves the neural network already considers promising, achieving much higher quality search with fewer simulations.
 
 ### Why Score-Aware Pass Gating?
+
 The value head can become overconfident about a winning position, causing the agent to pass prematurely and cede territory. The gate blocks passing when the engine's own board evaluation shows a margin below 5 points, acting as a safety net independent of the network's internals.
 
 ### Why Supervised Pre-training Before RL?
+
 Starting RL from random weights results in very poor self-play games, making the learning signal weak. Pre-training on ~1.8 M professional games with Adam gives the network a sensible policy prior, so self-play games are immediately more informative and RL converges faster.
